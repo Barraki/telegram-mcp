@@ -3,6 +3,184 @@
 from telegram_mcp.runtime import *
 
 
+DIGEST_MEDIA_ONLY = "[Media/No text]"
+DIGEST_SKIP_PHRASES = [
+    "Подписаться",
+    "Надсилайте нам фото",
+    "📲 Надіслати фото",
+    "Прислать новость",
+    "Реклама на канале",
+    "Приложение РБК",
+    "Канал РБК",
+    "Не грузятся фото",
+    "Читайте нас в MAX",
+    "Если у вас не загружается",
+    'Сайт "Страна"',
+    "Предложить новость",
+    "Главные новости",
+    "А теперь к другим новостям",
+    "Кратко:",
+    "наш дайджест новостей",
+]
+
+
+def _digest_dialog_type(entity) -> str:
+    if isinstance(entity, User):
+        return "user"
+    if isinstance(entity, Chat):
+        return "group"
+    if isinstance(entity, Channel):
+        return "channel" if getattr(entity, "broadcast", False) else "group"
+    return "unknown"
+
+
+def _normalize_chat_target(chat_id: Union[int, str]) -> set[str]:
+    if isinstance(chat_id, int):
+        return {str(chat_id)}
+
+    value = str(chat_id).strip().lower()
+    keys = {value}
+    if value.startswith("@"):
+        keys.add(value[1:])
+    else:
+        keys.add(f"@{value}")
+    return keys
+
+
+def _dialog_identity_keys(dialog) -> set[str]:
+    entity = dialog.entity
+    keys = {str(entity.id), str(utils.get_peer_id(entity))}
+
+    username = getattr(entity, "username", None)
+    if username:
+        username = username.lower()
+        keys.add(username)
+        keys.add(f"@{username}")
+
+    title = getattr(entity, "title", None) or getattr(entity, "first_name", None)
+    if title:
+        keys.add(title.strip().lower())
+
+    return keys
+
+
+def _should_skip_digest_text(text: str) -> bool:
+    stripped = (text or "").strip()
+    if not stripped or stripped == DIGEST_MEDIA_ONLY:
+        return True
+    if len(stripped) < 25:
+        return True
+
+    skip_hits = sum(1 for phrase in DIGEST_SKIP_PHRASES if phrase in stripped)
+    return skip_hits >= 2
+
+
+def _clean_digest_text(text: str) -> str:
+    lines = []
+    for line in (text or "").splitlines():
+        line = line.strip()
+        if not line or line == DIGEST_MEDIA_ONLY:
+            continue
+        if any(phrase in line for phrase in DIGEST_SKIP_PHRASES):
+            continue
+        lines.append(line)
+    return " ".join(lines)
+
+
+def _normalize_digest_text(text: str) -> str:
+    cleaned = re.sub(r"\s+", " ", (text or "")).strip()
+    cleaned = re.sub(r"^[^\wА-Яа-яЁёІіЇїЄєҐґ0-9]+", "", cleaned)
+    return cleaned
+
+
+def _digest_similarity(first: str, second: str) -> float:
+    first_words = {
+        word.lower().strip(".,:;!?\"'()[]{}«»—–-")
+        for word in first.split()
+        if len(word) > 3
+    }
+    second_words = {
+        word.lower().strip(".,:;!?\"'()[]{}«»—–-")
+        for word in second.split()
+        if len(word) > 3
+    }
+
+    if not first_words or not second_words:
+        return 0.0
+
+    return len(first_words & second_words) / min(len(first_words), len(second_words))
+
+
+def _digest_number_signature(text: str) -> tuple[str, ...]:
+    return tuple(re.findall(r"\d+(?:[.,]\d+)?", text or ""))
+
+
+def _digest_preview(text: str, max_length: int = 280) -> str:
+    parts = [part.strip() for part in re.split(r"(?<=[.!?])\s+", text or "") if part.strip()]
+    if not parts:
+        return ""
+
+    preview = parts[0]
+    if len(preview) < 120 and len(parts) > 1:
+        preview = f"{preview} {parts[1]}"
+
+    if len(preview) <= max_length:
+        return preview
+
+    return preview[: max_length - 1].rstrip() + "…"
+
+
+def _digest_title(text: str, max_words: int = 8) -> str:
+    words = [word.strip(".,:;!?\"'()[]{}«»") for word in (text or "").split()]
+    words = [word for word in words if word]
+    if not words:
+        return "Без названия"
+
+    title = " ".join(words[:max_words])
+    if len(words) > max_words:
+        title += "…"
+    return title
+
+
+def _group_digest_posts(posts: list[dict], similarity_threshold: float) -> list[dict]:
+    groups: list[dict] = []
+
+    for post in sorted(posts, key=lambda item: item["date"]):
+        placed = False
+        for group in groups:
+            if abs((post["date"] - group["latest_date"]).days) > 1:
+                continue
+            if group["number_signature"] != post["number_signature"]:
+                continue
+
+            best_similarity = max(
+                _digest_similarity(post["normalized_text"], existing["normalized_text"])
+                for existing in group["posts"]
+            )
+            if best_similarity < similarity_threshold:
+                continue
+
+            group["posts"].append(post)
+            group["latest_date"] = max(group["latest_date"], post["date"])
+            group["earliest_date"] = min(group["earliest_date"], post["date"])
+            group["channels"].add(post["channel"])
+            placed = True
+            break
+
+        if not placed:
+            groups.append(
+                {
+                    "posts": [post],
+                    "latest_date": post["date"],
+                    "earliest_date": post["date"],
+                    "channels": {post["channel"]},
+                    "number_signature": post["number_signature"],
+                }
+            )
+
+    return groups
+
+
 @mcp.tool(annotations=ToolAnnotations(title="Get Messages", openWorldHint=True, readOnlyHint=True))
 @with_account(readonly=True)
 @validate_id("chat_id")
@@ -935,6 +1113,203 @@ async def mark_as_read(chat_id: Union[int, str], account: str = None) -> str:
         return f"Marked all messages as read in chat {chat_id}."
     except Exception as e:
         return log_and_format_error("mark_as_read", e, chat_id=chat_id)
+
+
+@mcp.tool(
+    annotations=ToolAnnotations(
+        title="Digest Unread Chats",
+        openWorldHint=True,
+        destructiveHint=True,
+        idempotentHint=True,
+    )
+)
+@with_account(readonly=False)
+@validate_id("chat_ids")
+async def digest_unread_chats(
+    chat_ids: list[Union[int, str]] = None,
+    chat_type: str = "channel",
+    max_chats: int = 20,
+    per_chat_limit: int = 100,
+    only_unread: bool = True,
+    since_date: str = None,
+    mark_read_after: bool = False,
+    similarity_threshold: float = 0.55,
+    account: str = None,
+) -> str:
+    """
+    Build a deduplicated digest from recent chat messages and optionally mark processed chats as read.
+
+    Args:
+        chat_ids: Optional list of explicit chats to process. If omitted, recent dialogs are selected.
+        chat_type: Filter dialogs by type ('user', 'group', 'channel'). Ignored for unknown values.
+        max_chats: Maximum number of dialogs to inspect when chat_ids are not provided.
+        per_chat_limit: Maximum number of recent messages to inspect per chat.
+        only_unread: When true, only chats with unread messages are processed.
+        since_date: Optional lower date bound in YYYY-MM-DD format.
+        mark_read_after: Mark processed chats as read after building the digest.
+        similarity_threshold: Duplicate grouping threshold between 0 and 1.
+    """
+    try:
+        if max_chats < 1:
+            return "Invalid max_chats: value must be greater than 0."
+        if per_chat_limit < 1:
+            return "Invalid per_chat_limit: value must be greater than 0."
+        if similarity_threshold <= 0 or similarity_threshold > 1:
+            return "Invalid similarity_threshold: use a value between 0 and 1."
+
+        normalized_chat_type = (chat_type or "").strip().lower()
+        if normalized_chat_type not in {"", "user", "group", "channel"}:
+            return "Invalid chat_type. Use 'user', 'group', 'channel', or omit it."
+
+        since_date_obj = None
+        if since_date:
+            try:
+                since_date_obj = datetime.strptime(since_date, "%Y-%m-%d").replace(
+                    tzinfo=timezone.utc
+                )
+            except ValueError:
+                return "Invalid since_date format. Use YYYY-MM-DD."
+
+        cl = get_client(account)
+        await ensure_connected(cl)
+
+        target_keys = set()
+        if chat_ids:
+            for chat_id in chat_ids:
+                target_keys.update(_normalize_chat_target(chat_id))
+
+        selected_dialogs = []
+        matched_keys = set()
+        async for dialog in cl.iter_dialogs():
+            dialog_type = _digest_dialog_type(dialog.entity)
+            if normalized_chat_type and dialog_type != normalized_chat_type:
+                continue
+
+            dialog_keys = _dialog_identity_keys(dialog)
+            if target_keys:
+                if not dialog_keys & target_keys:
+                    continue
+                matched_keys.update(dialog_keys & target_keys)
+
+            if only_unread and getattr(dialog, "unread_count", 0) <= 0:
+                continue
+
+            selected_dialogs.append(dialog)
+            if not target_keys and len(selected_dialogs) >= max_chats:
+                break
+
+        if not selected_dialogs:
+            return "No chats matched the requested digest criteria."
+
+        posts = []
+        processed_dialogs = []
+        truncated_chats = []
+
+        for dialog in selected_dialogs:
+            unread_count = getattr(dialog, "unread_count", 0) or 0
+            fetch_limit = per_chat_limit
+            if only_unread and unread_count > 0:
+                fetch_limit = min(unread_count, per_chat_limit)
+                if unread_count > per_chat_limit:
+                    truncated_chats.append(f"{sanitize_name(dialog.name)} ({unread_count} unread)")
+
+            messages = await cl.get_messages(dialog.entity, limit=fetch_limit)
+            if not messages:
+                continue
+
+            processed_dialogs.append(dialog)
+            for message in messages:
+                if since_date_obj and message.date < since_date_obj:
+                    continue
+
+                raw_text = sanitize_user_content(message.message or DIGEST_MEDIA_ONLY)
+                if _should_skip_digest_text(raw_text):
+                    continue
+
+                cleaned_text = _normalize_digest_text(_clean_digest_text(raw_text))
+                if len(cleaned_text) < 30:
+                    continue
+
+                posts.append(
+                    {
+                        "channel": sanitize_name(dialog.name),
+                        "date": message.date,
+                        "message_id": message.id,
+                        "normalized_text": cleaned_text,
+                        "number_signature": _digest_number_signature(cleaned_text),
+                    }
+                )
+
+        if not posts:
+            if mark_read_after:
+                for dialog in processed_dialogs:
+                    await cl.send_read_acknowledge(dialog.entity)
+            return "No digestable messages found after filtering."
+
+        groups = _group_digest_posts(posts, similarity_threshold)
+        grouped_by_day: dict[str, list[str]] = {}
+
+        for group in sorted(groups, key=lambda item: item["latest_date"]):
+            representative = max(group["posts"], key=lambda item: len(item["normalized_text"]))
+            preview = _digest_preview(representative["normalized_text"])
+            title = _digest_title(preview)
+            day_key = group["latest_date"].strftime("%Y-%m-%d")
+            channels = ", ".join(sorted(group["channels"]))
+            line = (
+                f"- [{group['latest_date'].strftime('%Y-%m-%d %H:%M')}] **{title}**"
+                f" — {preview} [{channels}]"
+            )
+            grouped_by_day.setdefault(day_key, []).append(line)
+
+        if mark_read_after:
+            for dialog in processed_dialogs:
+                await cl.send_read_acknowledge(dialog.entity)
+
+        processed_names = ", ".join(sanitize_name(dialog.name) for dialog in processed_dialogs)
+        header_parts = [
+            f"Processed {len(processed_dialogs)} chat(s)",
+            f"grouped into {len(groups)} item(s)",
+            "unread only" if only_unread else "latest messages",
+        ]
+        if mark_read_after:
+            header_parts.append("marked as read")
+        if since_date:
+            header_parts.append(f"since {since_date}")
+
+        lines = [" | ".join(header_parts), f"Chats: {processed_names}"]
+        if target_keys and matched_keys != target_keys:
+            unresolved = sorted(target_keys - matched_keys)
+            if unresolved:
+                lines.append(f"Unmatched targets: {', '.join(unresolved)}")
+        if truncated_chats:
+            lines.append("Truncated by per_chat_limit: " + ", ".join(sorted(set(truncated_chats))))
+        lines.append("")
+
+        for day_key, day_lines in grouped_by_day.items():
+            lines.append(f"### {day_key}")
+            lines.extend(day_lines)
+            lines.append("")
+
+        return "\n".join(lines).strip()
+    except Exception as e:
+        logger.exception(
+            "digest_unread_chats failed "
+            f"(chat_ids={chat_ids}, chat_type={chat_type}, max_chats={max_chats}, "
+            f"per_chat_limit={per_chat_limit}, only_unread={only_unread}, "
+            f"since_date={since_date}, mark_read_after={mark_read_after}, account={account})"
+        )
+        return log_and_format_error(
+            "digest_unread_chats",
+            e,
+            chat_ids=chat_ids,
+            chat_type=chat_type,
+            max_chats=max_chats,
+            per_chat_limit=per_chat_limit,
+            only_unread=only_unread,
+            since_date=since_date,
+            mark_read_after=mark_read_after,
+            account=account,
+        )
 
 
 @mcp.tool(

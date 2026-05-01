@@ -44,7 +44,7 @@ The server currently includes 80+ MCP tools grouped into these areas:
 
 - **Accounts:** list configured accounts and route tool calls by account label.
 - **Chats and groups:** list chats, inspect metadata, create groups/channels, join or leave chats, invite users, manage admins, bans, default permissions, slow mode, topics, invite links, common chats, read receipts, and message links.
-- **Messages:** send, schedule, edit, delete, forward, pin, unpin, mark read, reply, search, inspect context, create polls, manage reactions, inspect inline buttons, and press inline callbacks.
+- **Messages:** send, schedule, edit, delete, forward, pin, unpin, mark read, reply, search, inspect context, create polls, manage reactions, inspect inline buttons, press inline callbacks, and build deduplicated unread digests.
 - **Contacts:** list, search, add, delete, block, unblock, import, export, inspect direct chats, and find recent contact interactions.
 - **Media:** send files, download media, upload files, send voice notes, stickers, GIFs, and inspect message media.
 - **Profile and privacy:** get your own account info, update profile fields, set or delete profile photos, inspect privacy settings, get user info/photos/status, and manage bot commands.
