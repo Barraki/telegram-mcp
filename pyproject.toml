@@ -26,10 +26,11 @@ dependencies = [
     "dotenv>=0.9.9",
     "httpx>=0.28.1",
     "mcp[cli]>=1.8.0,<2",
+    "pillow>=11.0.0",
     "python-dotenv>=1.1.0",
     "python-json-logger>=3.3.0",
     "qrcode>=8.2",
-    "telethon>=1.44.0",
+    "telethon>=1.45.0",
 ]
 
 [project.optional-dependencies]
@@ -43,12 +44,13 @@ proxy = [
 "Bug Tracker" = "https://github.com/chigwell/telegram-mcp/issues"
 
 [tool.setuptools]
-py-modules = ["main", "sanitize", "session_string_generator"]
+py-modules = ["main", "migrate_session", "sanitize", "session_string_generator"]
 packages = ["telegram_mcp", "telegram_mcp.tools"]
 
 [project.scripts]
 telegram-mcp = "main:main"
 telegram-mcp-generate-session = "session_string_generator:main"
+telegram-mcp-migrate-session = "migrate_session:main"
 
 [tool.black]
 line-length = 99

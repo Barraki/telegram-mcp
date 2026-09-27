@@ -134,6 +134,147 @@ def test_get_exposed_tools_mode_rejects_empty_allowlist():
     assert "at least one tool" in str(excinfo.value)
 
 
+def _synthetic_mcp_with_file_tools():
+    """A synthetic server exposing tools named like the real file-path tools."""
+    server = _synthetic_mcp()
+
+    @server.tool(annotations=ToolAnnotations(title="Send File", destructiveHint=True))
+    def send_file():
+        return "send_file"
+
+    @server.tool(annotations=ToolAnnotations(title="Upload File", destructiveHint=True))
+    def upload_file():
+        return "upload_file"
+
+    @server.tool(annotations=ToolAnnotations(title="Send Voice", destructiveHint=True))
+    def send_voice():
+        return "send_voice"
+
+    return server
+
+
+@pytest.fixture
+def reset_extension_allowlists(monkeypatch):
+    """Restore runtime.EXTENSION_ALLOWLISTS after a test rebuilds it."""
+    monkeypatch.setattr(runtime, "EXTENSION_ALLOWLISTS", dict(runtime.EXTENSION_ALLOWLISTS))
+    yield
+
+
+def test_get_file_extension_overrides_defaults_to_empty(monkeypatch):
+    monkeypatch.delenv("TELEGRAM_FILE_EXTENSIONS", raising=False)
+
+    assert runtime._get_file_extension_overrides() == {}
+
+
+def test_get_file_extension_overrides_parses_multiple_tools():
+    overrides = runtime._get_file_extension_overrides(
+        "send_file:.pdf,.png,.jpg;upload_file:.pdf,.png"
+    )
+
+    assert overrides == {
+        "send_file": {".pdf", ".png", ".jpg"},
+        "upload_file": {".pdf", ".png"},
+    }
+
+
+def test_get_file_extension_overrides_is_case_insensitive_and_tolerates_missing_dot():
+    overrides = runtime._get_file_extension_overrides("Send_File:.PDF,PNG")
+
+    assert overrides == {"send_file": {".pdf", ".png"}}
+
+
+def test_get_file_extension_overrides_tolerates_blank_entries():
+    overrides = runtime._get_file_extension_overrides(";send_file:.pdf;;upload_file:.png;")
+
+    assert overrides == {"send_file": {".pdf"}, "upload_file": {".png"}}
+
+
+def test_get_file_extension_overrides_rejects_malformed_entry_without_colon():
+    with pytest.raises(SystemExit) as excinfo:
+        runtime._get_file_extension_overrides("send_file.pdf")
+
+    assert "TELEGRAM_FILE_EXTENSIONS" in str(excinfo.value)
+
+
+def test_get_file_extension_overrides_rejects_empty_extension_list():
+    with pytest.raises(SystemExit) as excinfo:
+        runtime._get_file_extension_overrides("send_file:")
+
+    assert "TELEGRAM_FILE_EXTENSIONS" in str(excinfo.value)
+    assert "send_file" in str(excinfo.value)
+
+
+def test_get_file_extension_overrides_rejects_malformed_extension_token():
+    with pytest.raises(SystemExit) as excinfo:
+        runtime._get_file_extension_overrides("send_file:.pdf,.p d f")
+
+    assert "TELEGRAM_FILE_EXTENSIONS" in str(excinfo.value)
+
+
+def test_apply_file_extension_overrides_unset_keeps_current_behaviour(
+    monkeypatch, reset_extension_allowlists
+):
+    monkeypatch.delenv("TELEGRAM_FILE_EXTENSIONS", raising=False)
+    server = _synthetic_mcp_with_file_tools()
+
+    result = runtime._apply_file_extension_overrides(server)
+
+    assert result == runtime._DEFAULT_EXTENSION_ALLOWLISTS
+    assert runtime.EXTENSION_ALLOWLISTS == runtime._DEFAULT_EXTENSION_ALLOWLISTS
+    assert runtime._ensure_extension_allowed("send_file", Path("any.exe")) is None
+
+
+def test_apply_file_extension_overrides_merges_over_defaults(reset_extension_allowlists):
+    server = _synthetic_mcp_with_file_tools()
+
+    result = runtime._apply_file_extension_overrides(server, "send_file:.pdf,.png")
+
+    assert result["send_file"] == {".pdf", ".png"}
+    # Untouched defaults for other tools survive the merge.
+    assert result["send_voice"] == {".ogg", ".opus"}
+    assert runtime._ensure_extension_allowed("send_file", Path("doc.pdf")) is None
+    assert runtime._ensure_extension_allowed("send_file", Path("evil.exe")) is not None
+
+
+def test_apply_file_extension_overrides_replaces_named_default(reset_extension_allowlists):
+    server = _synthetic_mcp_with_file_tools()
+
+    result = runtime._apply_file_extension_overrides(server, "send_voice:.mp3")
+
+    assert result["send_voice"] == {".mp3"}
+    assert runtime._ensure_extension_allowed("send_voice", Path("clip.ogg")) is not None
+    assert runtime._ensure_extension_allowed("send_voice", Path("clip.mp3")) is None
+
+
+def test_apply_file_extension_overrides_is_case_insensitive_at_check_time(
+    reset_extension_allowlists,
+):
+    server = _synthetic_mcp_with_file_tools()
+
+    runtime._apply_file_extension_overrides(server, "send_file:.pdf")
+
+    assert runtime._ensure_extension_allowed("send_file", Path("DOC.PDF")) is None
+
+
+def test_apply_file_extension_overrides_rejects_unknown_tool(reset_extension_allowlists):
+    server = _synthetic_mcp_with_file_tools()
+
+    with pytest.raises(SystemExit) as excinfo:
+        runtime._apply_file_extension_overrides(server, "not_a_real_tool:.pdf")
+
+    assert "not_a_real_tool" in str(excinfo.value)
+    assert "TELEGRAM_FILE_EXTENSIONS" in str(excinfo.value)
+
+
+def test_apply_file_extension_overrides_rejects_malformed_extension(reset_extension_allowlists):
+    server = _synthetic_mcp_with_file_tools()
+
+    with pytest.raises(SystemExit) as excinfo:
+        runtime._apply_file_extension_overrides(server, "send_file:")
+
+    assert "TELEGRAM_FILE_EXTENSIONS" in str(excinfo.value)
+
+
 def test_discover_accounts_supports_suffixed_and_default_sessions(monkeypatch):
     _clear_session_env(monkeypatch)
     monkeypatch.setenv("TELEGRAM_SESSION_STRING_WORK", "work-session")
@@ -715,7 +856,7 @@ def test_log_and_format_error_returns_custom_and_generated_messages(caplog):
 
     generated = runtime.log_and_format_error("get_chat", RuntimeError("boom"))
     assert "code: CHAT-ERR-" in generated
-    assert "Check mcp_errors.log" in generated
+    assert "mcp_errors.log" not in generated
 
 
 def test_path_helper_edges(tmp_path, monkeypatch):
@@ -819,8 +960,11 @@ def test_configure_allowed_roots_from_cli_updates_runtime_and_main_alias(tmp_pat
     main._configure_allowed_roots_from_cli([str(root)])
     assert main.SERVER_ALLOWED_ROOTS == [root.resolve()]
 
-    with pytest.raises(SystemExit, match="Allowed root does not exist"):
-        runtime._configure_allowed_roots_from_cli([str(tmp_path / "missing")])
+    # Fork patch: missing roots are auto-created instead of SystemExit (fixes reboot crash)
+    missing = tmp_path / "missing"
+    runtime._configure_allowed_roots_from_cli([str(missing)])
+    assert missing.exists()
+    assert runtime.SERVER_ALLOWED_ROOTS == [missing.resolve()]
 
 
 def test_main_compatibility_wrappers_are_exported():
@@ -1002,3 +1146,110 @@ async def test_list_roots_unexpected_error_denies_without_opt_in(tmp_path, monke
     )
     assert status == runtime.ROOTS_STATUS_ERROR
     assert roots == []
+
+
+class _HangingRootsSession:
+    """Client that accepts roots/list but never answers it."""
+
+    async def list_roots(self):
+        await asyncio.sleep(3600)
+
+
+def _ctx_with_hanging_list_roots():
+    return SimpleNamespace(session=_HangingRootsSession())
+
+
+def test_roots_request_timeout_parsing(monkeypatch):
+    monkeypatch.delenv("TELEGRAM_ROOTS_TIMEOUT_SECONDS", raising=False)
+    assert runtime._roots_request_timeout() == runtime.ROOTS_REQUEST_TIMEOUT_DEFAULT
+    assert runtime._roots_request_timeout("2.5") == 2.5
+    assert runtime._roots_request_timeout("0") is None
+    assert runtime._roots_request_timeout("-1") is None
+    assert runtime._roots_request_timeout("nonsense") == runtime.ROOTS_REQUEST_TIMEOUT_DEFAULT
+
+
+@pytest.mark.asyncio
+async def test_list_roots_timeout_falls_back_when_opt_in(tmp_path, monkeypatch):
+    root = tmp_path / "root"
+    root.mkdir()
+    monkeypatch.setattr(runtime, "SERVER_ALLOWED_ROOTS", [root.resolve()])
+    monkeypatch.setenv("TELEGRAM_ALLOW_SERVER_ROOTS_FALLBACK", "1")
+    monkeypatch.setenv("TELEGRAM_ROOTS_TIMEOUT_SECONDS", "0.05")
+
+    roots, status = await runtime._get_effective_allowed_roots_with_status(
+        _ctx_with_hanging_list_roots()
+    )
+    assert status == runtime.ROOTS_STATUS_SERVER_FALLBACK
+    assert roots == [root.resolve()]
+
+
+@pytest.mark.asyncio
+async def test_list_roots_timeout_denies_without_opt_in(tmp_path, monkeypatch):
+    root = tmp_path / "root"
+    root.mkdir()
+    monkeypatch.setattr(runtime, "SERVER_ALLOWED_ROOTS", [root.resolve()])
+    monkeypatch.delenv("TELEGRAM_ALLOW_SERVER_ROOTS_FALLBACK", raising=False)
+    monkeypatch.setenv("TELEGRAM_ROOTS_TIMEOUT_SECONDS", "0.05")
+
+    roots, status = await runtime._get_effective_allowed_roots_with_status(
+        _ctx_with_hanging_list_roots()
+    )
+    assert status == runtime.ROOTS_STATUS_TIMEOUT
+    assert roots == []
+
+    _roots, error = await runtime._ensure_allowed_roots(
+        _ctx_with_hanging_list_roots(), "download_media"
+    )
+    assert error is not None
+    assert "roots/list" in error
+
+
+def test_get_file_extension_overrides_rejects_duplicate_tool_name():
+    """A repeated tool name must abort, not silently last-win.
+
+    ``send_file:.pdf;send_file:.exe`` used to keep only ``.exe``, so an
+    operator who meant to allow both got a config that looked applied and
+    was not.
+    """
+    with pytest.raises(SystemExit) as excinfo:
+        runtime._get_file_extension_overrides("send_file:.pdf;send_file:.exe")
+
+    message = str(excinfo.value)
+    assert "send_file" in message
+    assert "more than once" in message
+
+
+@pytest.mark.asyncio
+async def test_send_file_override_bites_on_the_real_resolution_path(tmp_path, monkeypatch):
+    """The override must bite where send_file actually resolves its argument.
+
+    ``send_file`` and ``upload_file`` go through
+    ``_resolve_readable_file_path``, which is what calls
+    ``_ensure_extension_allowed``. Asserting on the checker alone would not
+    prove the feature does anything for the two tools it was added for, so
+    this drives the real resolver with the allowlist the real applier built.
+    """
+    root = (tmp_path / "root").resolve()
+    root.mkdir()
+    blocked = root / "payload.exe"
+    blocked.write_text("x", encoding="utf-8")
+    allowed = root / "report.pdf"
+    allowed.write_text("x", encoding="utf-8")
+
+    monkeypatch.setattr(runtime, "SERVER_ALLOWED_ROOTS", [root])
+    # Registers the current dict for restore, then let the real applier
+    # overwrite the module global the way startup does.
+    monkeypatch.setattr(runtime, "EXTENSION_ALLOWLISTS", dict(runtime.EXTENSION_ALLOWLISTS))
+    runtime._apply_file_extension_overrides(value="send_file:.pdf")
+
+    resolved, error = await runtime._resolve_readable_file_path(
+        raw_path=str(blocked), ctx=None, tool_name="send_file"
+    )
+    assert resolved is None
+    assert error is not None and "not allowed for send_file" in error
+
+    resolved, error = await runtime._resolve_readable_file_path(
+        raw_path=str(allowed), ctx=None, tool_name="send_file"
+    )
+    assert error is None
+    assert resolved == allowed
